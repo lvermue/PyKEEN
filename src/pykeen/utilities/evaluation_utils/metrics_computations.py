@@ -100,7 +100,7 @@ def _compute_filtered_rank(
         object_batch,
         device,
         all_pos_triples,
-) -> Tuple[int, int]:
+) -> np.array:
     """
 
     :param kg_embedding_model:
@@ -128,6 +128,16 @@ def _compute_filtered_rank(
     )
 
 
+def _compute_ranks_from_scores(
+        all_scores,
+        true_score,
+) -> np.array:
+    opt_rank = (all_scores > true_score).sum() + 1
+    pes_rank = (all_scores >= true_score).sum() + 1
+    random_rank = ((all_scores.shape[0] + 1) + 1) / 2.0
+    return np.array(tuple(rank.detach().cpu().numpy() for rank in (opt_rank, pes_rank)) + (random_rank,))
+
+
 def _compute_rank(
         kg_embedding_model,
         pos_triple,
@@ -135,7 +145,7 @@ def _compute_rank(
         object_batch,
         device,
         all_pos_triples,
-) -> Tuple[int, int]:
+) -> np.array:
     """
 
     :param kg_embedding_model:
@@ -149,29 +159,19 @@ def _compute_rank(
     relation = pos_triple[1:2]
     object = pos_triple[2:3]
 
-    inverse_triple = torch.cat((object,
-                                relation + kg_embedding_model.inverse_model * kg_embedding_model.num_relations //2,
-                                subject))
-
     scores_of_corrupted_subjects = kg_embedding_model.predict_for_ranking(object,
                                                                           relation + kg_embedding_model.inverse_model *
                                                                           kg_embedding_model.num_relations // 2)
-
+    scores_of_corrupted_objects = kg_embedding_model.predict_for_ranking(subject, relation)
     score_of_positive_subject = scores_of_corrupted_subjects[subject]
     scores_of_corrupted_subjects = scores_of_corrupted_subjects[subject_batch]
-
-    scores_of_corrupted_objects = kg_embedding_model.predict_for_ranking(subject, relation)
     score_of_positive_object = scores_of_corrupted_objects[object]
     scores_of_corrupted_objects = scores_of_corrupted_objects[object_batch]
 
-    rank_of_positive_subject_based = (scores_of_corrupted_subjects > score_of_positive_subject).sum() + 1
+    subject_based = _compute_ranks_from_scores(scores_of_corrupted_subjects, score_of_positive_subject)
+    object_based = _compute_ranks_from_scores(scores_of_corrupted_objects, score_of_positive_object)
 
-    rank_of_positive_object_based = (scores_of_corrupted_objects > score_of_positive_object).sum() + 1
-
-    return (
-        rank_of_positive_subject_based.detach().cpu().numpy(),
-        rank_of_positive_object_based.detach().cpu().numpy(),
-    )
+    return np.stack([subject_based, object_based])
 
 
 @dataclass
@@ -192,7 +192,7 @@ def compute_metric_results(
         ks: Optional[List[int]] = None,
         *,
         use_tqdm: bool = True,
-) -> MetricResults:
+) -> Dict[str, MetricResults]:
     """Compute the metric results.
 
     :param all_entities:
@@ -207,13 +207,10 @@ def compute_metric_results(
     """
     start = timeit.default_timer()
 
-    ranks: List[int] = []
-    ranks_of_positive_subjects_based = []
-    ranks_of_positive_objects_based = []
-    hits_at_k_values = {
-        k: []
-        for k in (ks or DEFAULT_HITS_AT_K)
-    }
+    n_triples = mapped_test_triples.shape[0]
+    order = ['optimistic', 'pessimistic', 'expected_random', 'realistic', 'adjusted']
+    ranks = np.empty(shape=(n_triples, 2, 3))
+
     kg_embedding_model = kg_embedding_model.eval()
     kg_embedding_model = kg_embedding_model.to(device)
 
@@ -221,7 +218,7 @@ def compute_metric_results(
     all_pos_triples = torch.tensor(all_pos_triples, device=device)
     all_entities = torch.arange(kg_embedding_model.num_entities, device=device)
 
-    compute_rank_fct: Callable[..., Tuple[int, int]] = (
+    compute_rank_fct: Callable[..., np.array] = (
         _compute_filtered_rank
         if filter_neg_triples else
         _compute_rank
@@ -231,19 +228,17 @@ def compute_metric_results(
 
     mapped_test_triples = mapped_test_triples[(mapped_test_triples[:,1:2].flatten()).argsort()]
 
-    weird_triples = []
-
     if use_tqdm:
         mapped_test_triples = tqdm(mapped_test_triples, desc=f'{EMOJI} corrupting triples')
 
-    for pos_triple in mapped_test_triples:
+    for i, pos_triple in enumerate(mapped_test_triples):
         subject = pos_triple[0:1]
         object = pos_triple[2:3]
 
         subject_batch = all_entities != subject
         object_batch = all_entities != object
 
-        rank_of_positive_subject_based, rank_of_positive_object_based = compute_rank_fct(
+        ranks[i, :, :] = compute_rank_fct(
             kg_embedding_model=kg_embedding_model,
             pos_triple=pos_triple,
             subject_batch=subject_batch,
@@ -251,33 +246,28 @@ def compute_metric_results(
             device=device,
             all_pos_triples=all_pos_triples,
         )
-        # log.info(f"Calculating scores took {timeit.default_timer() - start:.3f} seconds")
+    realistic_rank = ranks[:, :, 0:2].mean(axis=-1)
+    adjusted_rank = realistic_rank / ranks[:, :, 2]
+    ranks = np.concatenate([ranks, realistic_rank[:, :, None], adjusted_rank[:, :, None]], axis=-1)
 
-        ranks.append(rank_of_positive_subject_based)
-        ranks.append(rank_of_positive_object_based)
-        ranks_of_positive_objects_based.append(rank_of_positive_object_based)
-        ranks_of_positive_subjects_based.append(rank_of_positive_subject_based)
+    # assert (ranks > 0.0).all(), (ranks > 0.0).all(axis=0)
+    mean_rank = np.mean(ranks, axis=(0, 1))
+    mean_reciprocal_rank = np.mean(np.reciprocal(ranks), axis=(0, 1))
+    ks = np.asarray(DEFAULT_HITS_AT_K)
+    # ranks.shape = (n, 4)
+    hits_at_k = np.mean(ranks[:, :, :, None] <= ks[None, None, None, :], axis=(0, 1))
+    assert hits_at_k.shape == (5, len(ks))
 
-
-    # Compute hits@k for k in {1,3,5,10}
-    update_multiple_hits_at_k(
-        hits_at_k_values,
-        ranks_of_positive_subjects_based=ranks_of_positive_subjects_based,
-        ranks_of_positive_objects_based=ranks_of_positive_objects_based,
-    )
-
-    mean_rank = float(np.mean(ranks))
-    mean_reciprocal_rank = float((1/np.vstack(ranks)).mean())
-    hits_at_k: Dict[int, float] = {
-        k: np.mean(values)
-        for k, values in hits_at_k_values.items()
+    results = {
+        key: MetricResults(
+            mean_rank=mean_rank[i_key],
+            mean_reciprocal_rank=mean_reciprocal_rank[i_key],
+            hits_at_k={k: hits_at_k[i_key, i_k] for i_k, k in enumerate(ks)}
+        )
+        for i_key, key in enumerate(order)
     }
 
     stop = timeit.default_timer()
     log.info(f"Evaluation took {stop-start:.2f} seconds")
 
-    return MetricResults(
-        mean_rank=mean_rank,
-        mean_reciprocal_rank=mean_reciprocal_rank,
-        hits_at_k=hits_at_k,
-    )
+    return results, ranks
