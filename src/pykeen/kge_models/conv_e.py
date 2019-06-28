@@ -57,8 +57,8 @@ class ConvE(BaseModule):
         self.inp_drop = torch.nn.Dropout(conv_e_input_dropout)
         self.hidden_drop = torch.nn.Dropout(conv_e_output_dropout)
         self.feature_map_drop = torch.nn.Dropout2d(conv_e_feature_map_dropout)
-        self.loss = torch.nn.BCELoss()
-        # self.loss = torch.nn.BCEWithLogitsLoss()
+        # self.loss = torch.nn.BCELoss()
+        self.loss = torch.nn.BCEWithLogitsLoss()
 
         self.conv1 = torch.nn.Conv2d(
             in_channels=ConvE_input_channels,
@@ -157,7 +157,9 @@ class ConvE(BaseModule):
 
         x += self.b.expand_as(x)
 
-        scores = torch.sigmoid(x)
+        # scores = torch.sigmoid(x)
+
+        scores = x
 
         return scores
 
@@ -180,7 +182,9 @@ class ConvE(BaseModule):
         x = torch.sum(torch.mul(x.flatten(), candidate_object_embeddings.flatten()).reshape(batch_size, -1), dim=1)
         x += self.b[object]
 
-        scores = torch.sigmoid(x)
+        # scores = torch.sigmoid(x)
+
+        scores = x
 
         # Class 0 represents false fact and class 1 represents true fact
         return scores
@@ -207,7 +211,10 @@ class ConvE(BaseModule):
 
         x += self.b.expand_as(x)
 
-        predictions = torch.sigmoid(x)
+        # # predictions = torch.sigmoid(x)
+
+        # predictions = self.predict_for_ranking(entities=heads, relations=relations)
+        predictions = x
 
         loss = self.loss(predictions, labels_full)
         return loss
